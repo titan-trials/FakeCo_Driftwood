@@ -62,3 +62,15 @@ def test_checkout_roundtrip(client):
 def test_checkout_rejects_unknown_product(client):
     r = client.post("/orders", json={"email": "x@example.com", "items": [{"product_id": 999, "qty": 1}]})
     assert r.status_code == 400
+
+
+def test_session_shows_loyalty_tier(client):
+    s = client.get("/session", params={"email": "customer42@example.com"}).json()
+    assert s["tier"] in ("Gold", "Silver", "Bronze")
+
+
+def test_new_customer_pays_full_price(client):
+    email = f"smoke-{uuid.uuid4().hex[:8]}@example.com"
+    order = client.post("/orders", json={"email": email, "items": [{"product_id": 1, "qty": 1}]}).json()
+    assert order["tier"] == "Bronze"
+    assert order["total_cents"] == order["subtotal_cents"]

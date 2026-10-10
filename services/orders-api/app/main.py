@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from .config import settings
 from .db import DatabaseTimeout, PoolExhausted, db
+from .loyalty import apply_discount, customer_tier
 from .telemetry import (APP_INFO, CACHE_REQUESTS, HTTP_LATENCY, HTTP_REQUESTS,
                         ORDER_REVENUE, ORDERS_PLACED, log_event)
 
@@ -208,7 +209,10 @@ async def bestsellers():
 async def session(email: str):
     """Called on every storefront page view to render the header (greeting, cart badge)."""
     items = await cache.hgetall(cart_key(email))
-    return {"email": email, "cart_items": sum(int(q) for q in items.values())}
+    async with db.connection() as conn:
+        tier = await customer_tier(conn, email)
+    return {"email": email, "cart_items": sum(int(q) for q in items.values()),
+            "tier": tier.name, "discount_pct": tier.discount_pct}
 
 
 class CartItem(BaseModel):
@@ -253,7 +257,9 @@ async def place_order(order: OrderIn):
                 if products[line.product_id]["stock"] < line.qty:
                     raise HTTPException(409, f"product {line.product_id} out of stock")
 
-            total = sum(products[l.product_id]["price_cents"] * l.qty for l in order.items)
+            subtotal = sum(products[l.product_id]["price_cents"] * l.qty for l in order.items)
+            tier = await customer_tier(conn, order.email)
+            total = apply_discount(subtotal, tier)
             order_id = await db.run(conn, "insert_order", "fetchval",
                                     "INSERT INTO orders (customer_email, total_cents, status) "
                                     "VALUES ($1, $2, 'paid') RETURNING id",
@@ -270,7 +276,8 @@ async def place_order(order: OrderIn):
     await cache.delete(cart_key(order.email))
     ORDERS_PLACED.inc()
     ORDER_REVENUE.inc(total)
-    return {"order_id": order_id, "total_cents": total, "status": "paid"}
+    return {"order_id": order_id, "subtotal_cents": subtotal, "tier": tier.name,
+            "discount_pct": tier.discount_pct, "total_cents": total, "status": "paid"}
 
 
 @app.get("/orders/{order_id}")
