@@ -25,7 +25,15 @@
   button { background:var(--ink); color:#fff; border:0; border-radius:6px; padding:7px 12px; cursor:pointer; font-size:13px; }
   button.primary { background:var(--accent); }
   .error { color:#b3261e; font-size:14px; }
-  .toast { position:fixed; bottom:20px; right:20px; background:var(--ink); color:#fff; padding:10px 16px; border-radius:8px; display:none; }
+  .toast { position:fixed; bottom:20px; right:20px; background:var(--ink); color:#fff; padding:10px 16px; border-radius:8px; display:none; max-width:420px; }
+  .detail { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; opacity:.75; }
+  .banner { display:none; align-items:flex-start; gap:12px; padding:12px 32px; font-size:14px;
+            background:#fdecea; color:#7a1d16; border-bottom:1px solid #f3c2bd; }
+  .banner.show { display:flex; }
+  .banner.warn { background:#fff6e0; color:#6b4a00; border-bottom-color:#f0dca8; }
+  .banner .icon { font-size:20px; line-height:1.2; }
+  .banner strong { display:block; font-size:15px; }
+  .error strong { display:block; }
 </style>
 </head>
 <body>
@@ -34,6 +42,11 @@
   <div class="who"><span id="who"></span><span class="badge" id="cart">0</span>
     <button class="primary" id="checkout" style="margin-left:12px">Checkout</button></div>
 </header>
+<div class="banner" id="banner" role="alert" aria-live="polite">
+  <span class="icon" id="banner-icon" aria-hidden="true"></span>
+  <div><strong id="banner-title"></strong><span id="banner-text"></span>
+    <div class="detail" id="banner-detail"></div></div>
+</div>
 <main>
   <h2>Bestsellers this month</h2>
   <div class="best" id="best"></div>
@@ -48,41 +61,136 @@ const email = localStorage.getItem("dw_email") ||
 const cart = {};
 const $ = id => document.getElementById(id);
 const money = c => "$" + (c / 100).toFixed(2);
-const toast = msg => { const t = $("toast"); t.textContent = msg; t.style.display = "block";
-                       setTimeout(() => t.style.display = "none", 2500); };
+const esc = v => String(v).replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+let toastTimer;
+const toast = (msg, ms = 2500) => { const t = $("toast"); t.textContent = msg; t.style.display = "block";
+                                    clearTimeout(toastTimer); toastTimer = setTimeout(() => t.style.display = "none", ms); };
 
-async function api(path, opts) {
-  const r = await fetch("/api" + path, opts);
-  if (!r.ok) throw new Error(`${r.status} on ${path}`);
+// ------------------------------------------------------------------ friendly errors
+const SLOW_MS = 4000;        // show "taking longer than usual" after this
+const GIVE_UP_MS = 20000;    // stop waiting (nginx itself gives up after 15 s)
+const CHECK_HEALTHY_MS = 10000;
+const CHECK_BROKEN_MS = 5000;
+
+const FRIENDLY = {
+  db_timeout:      { icon: "☕", title: "Uh oh, our coffee is taking too long to brew.", text: "Part of the shop is timing out. We're on it." },
+  gateway_timeout: { icon: "⏳", title: "Our kitchen didn't answer in time.", text: "Please try again in a moment." },
+  busy:            { icon: "🔥", title: "We're swamped right now.", text: "Please try again in a moment." },
+  server:          { icon: "⚠️", title: "Something went wrong on our side.", text: "We're looking into it." },
+  offline:         { icon: "📡", title: "We can't reach Driftwood right now.", text: "Check your connection or try again shortly." },
+  client:          { icon: "ℹ️", title: "That didn't work.", text: "" },
+};
+const SEVERITY = ["offline", "db_timeout", "gateway_timeout", "busy", "server"];
+
+class ApiError extends Error {
+  constructor(kind, status, reason, path) {
+    super(`${status || "no response"} on ${path}`);
+    Object.assign(this, { kind, status, reason, path });
+  }
+  get friendly() { return FRIENDLY[this.kind] || FRIENDLY.server; }
+  get detail() { return `${this.status || "no response"} · ${this.reason || "unknown error"} · ${this.path}`; }
+}
+
+function classify(status, reason) {
+  if (/time(d)?[ -]?out/i.test(reason)) return status === 504 ? "gateway_timeout" : "db_timeout";
+  if (status === 503) return "busy";
+  if (status === 504) return "gateway_timeout";
+  if (status >= 500) return "server";
+  return "client";
+}
+
+const problems = new Map();   // area -> ApiError, for the banner
+const slow = new Set();       // requests that are taking long
+let brokenSince = null;
+
+function report(area, err) {
+  if (err && err.kind !== "client") problems.set(area, err); else problems.delete(area);
+  if (problems.size && !brokenSince) brokenSince = new Date();
+  if (!problems.size) brokenSince = null;
+  renderBanner();
+}
+
+function renderBanner() {
+  const banner = $("banner");
+  const worst = [...problems.values()].sort((a, b) => SEVERITY.indexOf(a.kind) - SEVERITY.indexOf(b.kind))[0];
+  if (worst) {
+    const f = worst.friendly;
+    banner.className = "banner show";
+    $("banner-icon").textContent = f.icon;
+    $("banner-title").textContent = f.title;
+    $("banner-text").textContent = `${f.text} Since ${brokenSince.toLocaleTimeString()}.`;
+    $("banner-detail").textContent = worst.detail + (problems.size > 1 ? ` (+${problems.size - 1} more)` : "");
+  } else if (slow.size) {
+    banner.className = "banner show warn";
+    $("banner-icon").textContent = "⏳";
+    $("banner-title").textContent = "This is taking longer than usual…";
+    $("banner-text").textContent = "Hang tight, your coffee is on its way.";
+    $("banner-detail").textContent = [...slow].join(", ");
+  } else {
+    banner.className = "banner";
+  }
+}
+
+const errorBlock = (prefix, err) =>
+  `<span class="error"><strong>${esc(prefix)} ${esc(err.friendly.title)}</strong><span class="detail">${esc(err.detail)}</span></span>`;
+
+async function api(path, opts = {}) {
+  const ctrl = new AbortController();
+  const slowTimer = setTimeout(() => { slow.add(path); renderBanner(); }, SLOW_MS);
+  const giveUp = setTimeout(() => ctrl.abort(), GIVE_UP_MS);
+  let r;
+  try {
+    r = await fetch("/api" + path, { ...opts, signal: ctrl.signal });
+  } catch (e) {
+    throw e.name === "AbortError" ? new ApiError("gateway_timeout", 0, `no answer after ${GIVE_UP_MS / 1000} s`, path)
+                                  : new ApiError("offline", 0, "network error", path);
+  } finally {
+    clearTimeout(slowTimer); clearTimeout(giveUp);
+    if (slow.delete(path)) renderBanner();
+  }
+  if (!r.ok) {
+    let reason = r.statusText || "";
+    try { const body = await r.json(); reason = body.error || body.detail || reason; } catch (_) { /* not JSON */ }
+    if (typeof reason !== "string") reason = JSON.stringify(reason);
+    throw new ApiError(classify(r.status, reason), r.status, reason, path);
+  }
   return r.json();
 }
 
+// ------------------------------------------------------------------------- page
 async function loadSession() {
   try {
     const s = await api(`/session?email=${encodeURIComponent(email)}`);
     $("who").textContent = s.email + (s.tier ? ` · ${s.tier}` : "");
     $("cart").textContent = s.cart_items;
-  } catch (e) { $("who").textContent = email; }
+    report("session", null);
+  } catch (e) { $("who").textContent = email; report("session", e); }
 }
 
+let lastBest = null;
 async function loadBestsellers() {
   try {
     const best = await api("/bestsellers");
-    $("best").innerHTML = best.map((b, i) => `<div>#${i + 1} ${b.name} · ${b.origin}</div>`).join("");
-  } catch (e) { $("best").innerHTML = `<span class="error">Bestsellers unavailable (${e.message})</span>`; }
+    const html = best.map((b, i) => `<div>#${i + 1} ${esc(b.name)} · ${esc(b.origin)}</div>`).join("");
+    if (html !== lastBest) { $("best").innerHTML = html; lastBest = html; }
+    report("bestsellers", null);
+  } catch (e) { $("best").innerHTML = errorBlock("Bestsellers unavailable.", e); lastBest = null; report("bestsellers", e); }
 }
 
+let lastProducts = null;
 async function loadProducts() {
   try {
     const products = await api("/products");
-    $("products").innerHTML = products.map(p => `
+    const html = products.map(p => `
       <div class="card">
-        <div class="origin">${p.origin} · ${p.roast}</div>
-        <div class="name">${p.name}</div>
+        <div class="origin">${esc(p.origin)} · ${esc(p.roast)}</div>
+        <div class="name">${esc(p.name)}</div>
         <div class="row"><span>${money(p.price_cents)}</span>
-          <button onclick="addToCart(${p.id})">Add to cart</button></div>
+          <button onclick="addToCart(${Number(p.id)})">Add to cart</button></div>
       </div>`).join("");
-  } catch (e) { $("products").innerHTML = `<span class="error">Catalogue unavailable (${e.message})</span>`; }
+    if (html !== lastProducts) { $("products").innerHTML = html; lastProducts = html; }
+    report("products", null);
+  } catch (e) { $("products").innerHTML = errorBlock("Our coffee list isn't loading.", e); lastProducts = null; report("products", e); }
 }
 
 async function addToCart(id) {
@@ -91,7 +199,9 @@ async function addToCart(id) {
     await api("/cart", { method: "POST", headers: { "content-type": "application/json" },
                          body: JSON.stringify({ email, product_id: id, qty: 1 }) });
     loadSession();
-  } catch (e) { toast("Could not add to cart: " + e.message); }
+  } catch (e) {
+    toast(e.kind === "client" ? `Could not add to cart: ${e.reason}` : `Could not add to cart. ${e.friendly.title}`, 4000);
+  }
 }
 
 $("checkout").onclick = async () => {
@@ -103,10 +213,21 @@ $("checkout").onclick = async () => {
     Object.keys(cart).forEach(k => delete cart[k]);
     toast(`Order #${o.order_id} placed · ${money(o.total_cents)}`);
     loadSession();
-  } catch (e) { toast("Checkout failed: " + e.message); }
+  } catch (e) {
+    toast(e.kind === "client" ? `Checkout failed: ${e.reason}` : `Checkout failed. ${e.friendly.title}`, 4000);
+  }
 };
 
-loadSession(); loadBestsellers(); loadProducts();
+// Keep checking so the page notices a problem, and recovers by itself once it is fixed.
+let refreshing = false;
+async function refresh() {
+  if (!refreshing) {
+    refreshing = true;
+    try { await Promise.all([loadSession(), loadBestsellers(), loadProducts()]); } finally { refreshing = false; }
+  }
+  setTimeout(refresh, problems.size ? CHECK_BROKEN_MS : CHECK_HEALTHY_MS);
+}
+refresh();
 </script>
 </body>
 </html>
