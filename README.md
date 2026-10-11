@@ -110,6 +110,57 @@ Production is never touched. It seeds its own copy of the data on first boot.
 To ship a fix that passed: `git merge --no-ff fix/INC-0042 && ops/deploy.sh "INC-0042"`.
 Your command gate is the thing that should be allowed to run that line.
 
+## Jira: incident tickets
+
+`ops/jira.py` files incidents in your team's Jira Cloud project, and `ops/detector.py`
+opens and closes them automatically. Set these once on each machine (in `~/.bashrc`,
+never in git):
+
+```bash
+export JIRA_URL=https://yourteam.atlassian.net
+export JIRA_EMAIL=you@example.com          # the account the token belongs to
+export JIRA_TOKEN=...                      # https://id.atlassian.com/manage-profile/security/api-tokens
+export JIRA_PROJECT=SRE                    # project key
+# optional
+export JIRA_ISSUE_TYPE=Task                # default Task
+export JIRA_STATUS_MAP='Awaiting Approval=In Review,Resolved=Done'
+export REQUIRE_APPROVAL=false              # or true: deploys wait for a human
+```
+
+Then check the setup against the live site: `python3 ops/jira.py doctor`.
+
+**Lifecycle.** An incident moves through the stages Open → Investigating → Fix Proposed →
+Awaiting Approval → Deploying → Monitoring → Resolved. The exact stage is shown as a
+`dw-<stage>` label on the ticket, and the Jira status follows `JIRA_STATUS_MAP`. The
+default map is Open = To Do, Resolved = Done, and everything else = In Progress, which
+fits a standard Jira Software project. Structured data (the detection snapshot, root
+cause, fix branch, MTTR) is stored in a hidden issue property called `driftwood`.
+
+| Who | Does | Call |
+|---|---|---|
+| detector | opens the ticket after 3 failed checks in a row (15 s) | automatic |
+| Investigator | posts findings, records root cause | `comment`, `set KEY root_cause=...`, `move KEY Investigating` |
+| Engineer | proposes the fix | `move KEY "Fix Proposed"`, `set KEY fix_branch=...` |
+| Guardian | posts sandbox before/after, asks to deploy | `comment --file report.md`, `request-approval KEY` |
+| command gate | waits for the go-ahead, then deploys | `wait-approval KEY` (exit 0 = go), `move KEY Deploying` |
+| detector | Deploying → Monitoring once healthy, then resolves with timeline + MTTR after 60 s healthy | automatic |
+
+**Human approval** is a switch: `python3 ops/jira.py approval-required on|off` (or
+`REQUIRE_APPROVAL`). When it's on, `request-approval` moves the ticket to Awaiting
+Approval and asks the on-call person to comment `/approve` or `/reject <reason>` on it
+in Jira. `wait-approval` returns as soon as that comment appears, and moving to
+Deploying is refused while approval is pending or rejected. When it's off,
+`request-approval` returns `not_required` and the agents carry on by themselves.
+
+All of this is also importable from Python (`from jira import Jira`); see the top of
+`ops/jira.py`.
+
+**Privacy and offline.** Tickets go to Atlassian's cloud. The ticket text is kept to
+metrics, the version, and whatever the agents choose to post, so have them summarize
+rather than paste raw logs or code. Jira also needs internet: with the network
+unplugged, the detector logs `tracker_unavailable` and keeps watching, and
+`wait-approval` can't see approvals. Turn approval off for an offline demo.
+
 ## Reset between demo runs
 
 ```bash
@@ -147,5 +198,5 @@ services/frontend/     nginx.conf, html/index.html
 services/loadgen/      loadgen.py (continuous traffic, or --requests N for a fixed test)
 db/init/               schema + seed (first boot only)
 prometheus/            scrape config + recording rules/alerts
-ops/                   deploy, inject, reset, reset_db, sandbox, status
+ops/                   deploy, inject, reset, reset_db, sandbox, status, jira (Jira Cloud client), detector
 ```
